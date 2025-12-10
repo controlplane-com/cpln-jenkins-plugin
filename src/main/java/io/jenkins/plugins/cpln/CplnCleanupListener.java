@@ -98,6 +98,14 @@ public class CplnCleanupListener extends ComputerListener {
             return;
         }
         
+        // Only cleanup if the workload was actually provisioned
+        // This prevents cleanup during initial startup when the agent hasn't connected yet
+        if (!computer.isWorkloadProvisioned()) {
+            LOGGER.log(FINE, "Ignoring offline event for {0} - workload not yet provisioned", 
+                    computer.getName());
+            return;
+        }
+        
         String workloadName = agent.getNodeName();
         Cloud cloud = agent.getCloud();
         
@@ -114,7 +122,7 @@ public class CplnCleanupListener extends ComputerListener {
 
     /**
      * Called when a computer fails to launch.
-     * Immediate cleanup since the workload may have been created but the agent never connected.
+     * Only cleanup if the workload was actually created in CPLN.
      */
     @Override
     public void onLaunchFailure(hudson.model.Computer c, TaskListener listener) throws IOException, InterruptedException {
@@ -128,29 +136,34 @@ public class CplnCleanupListener extends ComputerListener {
             return;
         }
         
+        // Only cleanup if workload was actually provisioned in CPLN
+        // This prevents premature cleanup during normal startup
+        if (!computer.isWorkloadProvisioned()) {
+            LOGGER.log(FINE, "Ignoring launch failure for {0} - workload not yet provisioned", 
+                    computer.getName());
+            return;
+        }
+        
         String workloadName = agent.getNodeName();
         Cloud cloud = agent.getCloud();
         
-        LOGGER.log(WARNING, "CPLN agent {0} launch failed, scheduling immediate cleanup", workloadName);
+        LOGGER.log(WARNING, "CPLN agent {0} launch failed, scheduling cleanup", workloadName);
         
-        // Immediate cleanup on launch failure
-        scheduleCleanup(workloadName, cloud, "launch failure", 0);
+        // Schedule cleanup with delay to allow for transient failures
+        scheduleCleanup(workloadName, cloud, "launch failure");
     }
 
     /**
      * Called when computer configuration is updated (including removal).
+     * We intentionally do NOT force reconciliation here as it can interfere
+     * with normal node creation. The periodic WorkloadReconciler handles
+     * orphan cleanup on its own schedule.
      */
     @Override
     public void onConfigurationChange() {
-        // Force reconciliation on configuration changes to catch any orphaned workloads
-        Jenkins jenkins = Jenkins.getInstanceOrNull();
-        if (jenkins == null) return;
-        
-        for (hudson.slaves.Cloud cloud : jenkins.clouds) {
-            if (cloud instanceof Cloud) {
-                WorkloadReconciler.forceReconcile((Cloud) cloud);
-            }
-        }
+        // Do nothing - let the periodic reconciler handle orphan cleanup
+        // Forcing reconciliation here can interfere with node creation
+        LOGGER.log(FINE, "Configuration change detected, periodic reconciler will handle cleanup");
     }
 
     /**

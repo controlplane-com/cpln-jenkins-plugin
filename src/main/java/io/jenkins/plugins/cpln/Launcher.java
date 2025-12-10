@@ -93,9 +93,11 @@ public class Launcher extends JNLPLauncher {
                             new Object[]{workloadName, cloud});
                 }
             } else {
-                // Workload already exists - mark as provisioned
+                // Workload already exists - this can happen with shared (non-unique) agents
+                // Mark as provisioned and accepting tasks, the agent should connect via WebSocket
                 computer.setWorkloadProvisioned(true);
-                launched = true;
+                computer.setAcceptingTasks(true);
+                // Don't set launched = true here - this allows Jenkins to retry if needed
                 
                 LOGGER.log(INFO, "Found workload agent already deployed on cloud {0} with workload {1}...",
                         new Object[]{cloud, workloadName});
