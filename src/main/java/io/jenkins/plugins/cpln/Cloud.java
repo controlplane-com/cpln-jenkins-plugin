@@ -32,6 +32,25 @@ import java.util.stream.Stream;
 import jenkins.model.Jenkins;
 import org.kohsuke.stapler.*;
 
+/**
+ * CPLN Cloud implementation for Jenkins.
+ * 
+ * This cloud provisions Jenkins agents as CPLN workloads. Cleanup of workloads
+ * is handled through multiple mechanisms to ensure robustness:
+ * 
+ * 1. Agent._terminate() - Called by Jenkins retention strategy for graceful termination
+ * 2. CplnCleanupListener - Handles abnormal disconnections and connection failures
+ * 3. WorkloadReconciler - Periodic background cleanup of orphan workloads
+ * 
+ * This ensures workloads are cleaned up regardless of:
+ * - Handshake failures
+ * - ClosedChannelException
+ * - Missing X-Remoting-Capability headers
+ * - OOM kills
+ * - Fast exits
+ * - Abnormal websocket terminations
+ * - Jenkins controller restarts
+ */
 @SuppressFBWarnings
 public class Cloud extends hudson.slaves.Cloud {
 
@@ -292,15 +311,15 @@ public class Cloud extends hudson.slaves.Cloud {
         // configuring the cloud with no executors prevents new jobs from
         // being assigned to agents of this cloud. Updating the executor number to > 0
         // results in any already waiting job being able to run on agents of this cloud again.
-        if(getExecutors() == 0){
+        if (getExecutors() == 0) {
             return Collections.emptyList();
         }
 
         String label;
         Stream<Node> nodes;
-        if(Objects.nonNull(state.getLabel())) {
+        if (Objects.nonNull(state.getLabel())) {
             label = state.getLabel().getName();
-            if(!state.getLabel().matches(getLabelAtoms())){
+            if (!state.getLabel().matches(getLabelAtoms())) {
                 LOGGER.log(WARNING, "Label {0} not supported by {1}. Use one of '{2}'",
                         new Object[]{label, this, getLabels()});
                 return Collections.emptyList();
@@ -316,7 +335,7 @@ public class Cloud extends hudson.slaves.Cloud {
 
         int realExcessWorkload = 1;
         Set<Node> nodeSet = new LinkedHashSet<>();
-        if(!getUseUniqueAgents()) {
+        if (!getUseUniqueAgents()) {
             final String agentNameUnlabeled = agentNameBase;
             nodes = nodes.filter(Agent.class::isInstance)
                     .filter(Node::isAcceptingTasks)
@@ -325,7 +344,7 @@ public class Cloud extends hudson.slaves.Cloud {
         } else {
             realExcessWorkload = excessWorkload;
         }
-        if(!getUseUniqueAgents() && !nodeSet.isEmpty()) {
+        if (!getUseUniqueAgents() && !nodeSet.isEmpty()) {
             String labelInfo = label.isEmpty() ? "no label" : String.format("label: %s", label);
             LOGGER.log(INFO, "Agent found for {0}: {1} for tasks with {2}",
                     new Object[]{this, nodeSet.iterator().next().getNodeName(), labelInfo});
@@ -333,19 +352,23 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         // if the cloud has labels, it can choose to take or not to take unlabeled jobs
-        if(label.isEmpty() && !Strings.isNullOrEmpty(getLabels()) && !getAllowJobsWithoutLabels()){
+        if (label.isEmpty() && !Strings.isNullOrEmpty(getLabels()) && !getAllowJobsWithoutLabels()) {
             return Collections.emptyList();
         }
 
         try {
             Set<NodeProvisioner.PlannedNode> plannedNodes = new LinkedHashSet<>();
-            while(realExcessWorkload-- > 0) {
+            while (realExcessWorkload-- > 0) {
                 String agentName = getAgentName(agentNameBase);
                 Agent agent = new Agent(agentName, "", new Launcher());
                 agent.setCloud(this);
                 agent.setLabelString(label);
                 agent.setNumExecutors(getExecutors());
                 agent.setRetentionStrategy(new CloudRetentionStrategy(getRetentionMins()));
+                
+                // Track the workload for reconciliation
+                WorkloadReconciler.trackWorkload(agentName, this.name, null);
+                
                 NodeProvisioner.PlannedNode node = new NodeProvisioner.PlannedNode(
                         name, CompletableFuture.completedFuture(agent), getExecutors());
                 plannedNodes.add(node);
@@ -365,7 +388,7 @@ public class Cloud extends hudson.slaves.Cloud {
     }
 
     private String getAgentName(String agentNameBase) {
-        if(getUseUniqueAgents()) {
+        if (getUseUniqueAgents()) {
             String uniqueSuffix = String.format("-%s",
                     UUID.randomUUID().toString().substring(0, 8));
             return String.format("%s%s", agentNameBase, uniqueSuffix);
@@ -393,7 +416,7 @@ public class Cloud extends hudson.slaves.Cloud {
 
         public ListBoxModel doFillOrgItems(@AncestorInPath ItemGroup owner,
                                             @QueryParameter Secret apiKey) {
-            if(Objects.isNull(apiKey) || Strings.isNullOrEmpty(apiKey.getPlainText())) {
+            if (Objects.isNull(apiKey) || Strings.isNullOrEmpty(apiKey.getPlainText())) {
                 return new ListBoxModel();
             }
 
@@ -424,7 +447,7 @@ public class Cloud extends hudson.slaves.Cloud {
         public ListBoxModel doFillGvcItems(@AncestorInPath ItemGroup owner,
                                             @QueryParameter String org,
                                             @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org)) {
+            if (Strings.isNullOrEmpty(org)) {
                 return new ListBoxModel();
             }
 
@@ -470,7 +493,7 @@ public class Cloud extends hudson.slaves.Cloud {
                                            @QueryParameter String org,
                                            @QueryParameter String gvc,
                                            @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
+            if (Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
                 return new ListBoxModel();
             }
 
@@ -505,7 +528,7 @@ public class Cloud extends hudson.slaves.Cloud {
                                                      @QueryParameter String org,
                                                      @QueryParameter String gvc,
                                                      @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
+            if (Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
                 return new ListBoxModel();
             }
 
@@ -537,18 +560,18 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckGvc(@QueryParameter String org, @QueryParameter String gvc) {
-            if(orgGvcLocations.isEmpty()) {
+            if (orgGvcLocations.isEmpty()) {
                 return FormValidation.ok();
             }
             Map<String, List<String>> orgMap = orgGvcLocations.get(org);
-            if(orgMap == null || orgMap.isEmpty()) {
+            if (orgMap == null || orgMap.isEmpty()) {
                 return FormValidation.ok();
             }
             List<String> gvcLocations = orgMap.get(gvc);
-            if(gvcLocations == null || gvcLocations.isEmpty()){
+            if (gvcLocations == null || gvcLocations.isEmpty()) {
                 return FormValidation.ok();
             }
-            if(gvcLocations.size() == 1){
+            if (gvcLocations.size() == 1) {
                 return FormValidation.ok();
             }
             return FormValidation.error(
@@ -557,7 +580,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckAgentWorkload(@QueryParameter String agentWorkload) {
-            if(!workloadPattern.matcher(agentWorkload).matches()){
+            if (!workloadPattern.matcher(agentWorkload).matches()) {
                 return FormValidation
                         .error(String.format("Agent Workload must be of form %s, " +
                                 "e.g. myjenkins-east-coast-tester", workloadPattern.pattern()));
@@ -566,7 +589,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckLabels(@QueryParameter String labels) {
-            if(!labelPattern.matcher(labels).matches()){
+            if (!labelPattern.matcher(labels).matches()) {
                 return FormValidation
                         .error(String.format("Labels must be of form %s, " +
                                 "e.g. 'label1' or 'label1 label2 linux-high-load' without the quotes",
@@ -576,7 +599,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckExecutors(@QueryParameter int executors) {
-            if(executors < 0){
+            if (executors < 0) {
                 return FormValidation
                         .error(String.format("The # of executors must be a non-negative integer, found %d", executors));
             }
@@ -584,23 +607,25 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckCpu(@QueryParameter int cpu) {
-            if(cpu <= 0){
+            if (cpu < Utils.MIN_CPU_MILLICORES) {
                 return FormValidation
-                        .error(String.format("The CPU millicores must be a positive integer, found %d", cpu));
+                        .error(String.format("The CPU millicores must be at least %d (minimum for CPLN), found %d", 
+                                Utils.MIN_CPU_MILLICORES, cpu));
             }
             return FormValidation.ok();
         }
 
-        public FormValidation doChecMemory(@QueryParameter int memory) {
-            if(memory <= 0){
+        public FormValidation doCheckMemory(@QueryParameter int memory) {
+            if (memory < Utils.MIN_MEMORY_MEBIBYTES) {
                 return FormValidation
-                        .error(String.format("The Memory mebibytes must be a positive integer, found %d", memory));
+                        .error(String.format("The Memory mebibytes must be at least %d (minimum for CPLN), found %d", 
+                                Utils.MIN_MEMORY_MEBIBYTES, memory));
             }
             return FormValidation.ok();
         }
 
         public FormValidation doCheckRetentionMins(@QueryParameter int retentionMins) {
-            if(retentionMins < 1){
+            if (retentionMins < 1) {
                 return FormValidation
                         .error(String.format("The Idle Agent Retention Time must be >= 1 minute, found %d",
                                 retentionMins));
@@ -609,7 +634,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckAgentImage(@QueryParameter String agentImage) {
-            if(Strings.isNullOrEmpty(agentImage)){
+            if (Strings.isNullOrEmpty(agentImage)) {
                 return FormValidation
                         .error("The Jenkins Agent Image cannot be empty");
             }
@@ -617,8 +642,8 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckVolumeSetPath(@QueryParameter String volumeSetName, @QueryParameter String volumeSetPath) {
-            if((Strings.isNullOrEmpty(volumeSetName) && !Strings.isNullOrEmpty(volumeSetPath))
-            || (!Strings.isNullOrEmpty(volumeSetName) && Strings.isNullOrEmpty(volumeSetPath))){
+            if ((Strings.isNullOrEmpty(volumeSetName) && !Strings.isNullOrEmpty(volumeSetPath))
+            || (!Strings.isNullOrEmpty(volumeSetName) && Strings.isNullOrEmpty(volumeSetPath))) {
                 return FormValidation
                         .error("The Volume Set Path cannot be empty if the Volume Set Name is not empty and vice versa");
             }
@@ -626,7 +651,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckJenkinsControllerUrl(@QueryParameter String jenkinsControllerUrl) {
-            if(Strings.isNullOrEmpty(jenkinsControllerUrl)){
+            if (Strings.isNullOrEmpty(jenkinsControllerUrl)) {
                 return FormValidation
                         .error("The Jenkins Controller Url cannot be empty");
             }
@@ -634,7 +659,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckApiKey(@QueryParameter String apiKey) {
-            if(Strings.isNullOrEmpty(apiKey)){
+            if (Strings.isNullOrEmpty(apiKey)) {
                 return FormValidation
                         .error("The Control Plane Api Key cannot be empty");
             }

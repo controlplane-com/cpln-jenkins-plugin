@@ -70,10 +70,16 @@ THE SOFTWARE.
 
     <f:entry title="Specify CPU resources (millicores)" field="cpu">
         <f:number default="200"/>
+        <f:description>
+            Minimum: 25 millicores. Do not exceed your CPLN org quota.
+        </f:description>
     </f:entry>
 
     <f:entry title="Specify Memory resources (mebibytes/MiB)" field="memory">
         <f:number default="512"/>
+        <f:description>
+            Minimum: 32 MiB. Do not exceed your CPLN org quota.
+        </f:description>
     </f:entry>
 
     <f:entry title="Specify Idle Agent Retention Time (minutes)" field="retentionMins">

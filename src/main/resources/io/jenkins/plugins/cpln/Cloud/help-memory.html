@@ -1,3 +1,28 @@
 <div>
-    The memory (in mebibytes/MiB) configured for the jenkins agent container.
+    <p>
+        Specify the Memory resources in mebibytes (MiB) for the Jenkins agent container.
+    </p>
+    <p>
+        <strong>Minimum:</strong> 32 MiB (CPLN platform minimum)
+    </p>
+    <p>
+        <strong>Default:</strong> 512 MiB
+    </p>
+    <p>
+        <strong>Note:</strong> Do not exceed your CPLN organization's memory quota. 
+        Check your quota in the Control Plane console under Org settings.
+    </p>
+    <p>
+        <strong>Warning:</strong> Setting memory too low may cause OOM (Out of Memory) kills.
+        The Jenkins inbound-agent typically needs at least 256 MiB for basic operation.
+    </p>
+    <p>
+        Examples:
+        <ul>
+            <li>256 MiB = minimum recommended for Jenkins agents</li>
+            <li>512 MiB = good for light to moderate builds</li>
+            <li>1024 MiB = recommended for moderate to heavy builds</li>
+            <li>2048 MiB = for memory-intensive builds (e.g., large Java projects)</li>
+        </ul>
+    </p>
 </div>

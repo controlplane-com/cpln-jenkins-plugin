@@ -1,3 +1,24 @@
 <div>
-    The cpu (in millicores) configured for the jenkins agent container.
+    <p>
+        Specify the CPU resources in millicores (m) for the Jenkins agent container.
+    </p>
+    <p>
+        <strong>Minimum:</strong> 25 millicores (CPLN platform minimum)
+    </p>
+    <p>
+        <strong>Default:</strong> 200 millicores
+    </p>
+    <p>
+        <strong>Note:</strong> Do not exceed your CPLN organization's CPU quota. 
+        Check your quota in the Control Plane console under Org settings.
+    </p>
+    <p>
+        Examples:
+        <ul>
+            <li>25m = minimum for basic workloads</li>
+            <li>200m = good for light Jenkins agents</li>
+            <li>500m = recommended for moderate build workloads</li>
+            <li>1000m = 1 full CPU core for heavy builds</li>
+        </ul>
+    </p>
 </div>
