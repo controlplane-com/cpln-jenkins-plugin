@@ -65,7 +65,7 @@ which can be used as is but should be removed later)
 - Logout and restart the controller;
 - Login with the account created above;
 - Go to the configuration, click ```Plugins -> Installed Plugins```;
-- Verify that ```Control Plane Plugin Version 2.0.0``` is available and enabled;
+- Verify that ```Control Plane Plugin``` is available and enabled;
 - Go to configuration (```<url>/manage/```) again, Click ```Security```, in the section ```Agents```, select ```Random``` for the ```TCP port for inbound agents``` and ```Save```;
 
 #### Create Cloud and Job Resources 
@@ -81,7 +81,7 @@ Prepare your Jenkins instance for the plugin to provision / manage resources in 
 - Select the org. This will update the available GVCs in the ```gvc``` field;
 - Although all GVCs are reported, only GVCs with one location will be accepted as only one agent (replica) per cloud config (and label) can be deployed per Jenkins requirements;
 - Set the agent workload name, e.g. ```west1-generic```;
-- Optional. Set the volume set name from the available options in the selected gvc. If the empty option is selected then the volume set path must also be empty;
+- Optional. Set the volume set name from the available options in the selected gvc (volume set must be of type: shared). If the empty option is selected then the volume set path must also be empty;
 - Optional. Set the volume set path (any valid path preferred in the agent workload container). If the empty option is selected in the volume set name then the path must also be empty;
   - ![Plugin](/docs/volumeset-in-gvc.png "Volume Set in GVC")
   - ![Plugin](/docs/jenkins-cloud-volumeset-config.png "Volume Set Config in Jenkins Cpln Cloud")
@@ -135,8 +135,8 @@ Prepare your Jenkins instance for the plugin to provision / manage resources in 
 - The Jenkins inbound-agent is a Java process that requires adequate resources to start. Setting values too low will cause agent startup failures or OOM kills.
 
 #### Volume Sets
-- When using Volume Sets, the volume **must be of type `shared`** (NFS-based)
-- Volumes of type `ext4` or `xfs` are **NOT supported** because they cannot be mounted by multiple agents simultaneously
+- When using Volume Sets, the volume **must be of type `shared`**
+- Volumes of type `ext4` or `xfs` are **NOT supported** because they are not compatible on a standard workload
 
 #### Provisioning Cooldown
 - The **Provisioning Cooldown** setting (default: 60 seconds) prevents over-provisioning when agents take time to connect
