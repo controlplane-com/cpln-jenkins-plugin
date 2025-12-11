@@ -96,11 +96,10 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
     protected void execute(TaskListener listener) {
         Jenkins jenkins = Jenkins.getInstanceOrNull();
         if (jenkins == null) {
-            LOGGER.log(WARNING, "StuckAgentDetector: Jenkins instance is null, skipping");
             return;
         }
 
-        LOGGER.log(INFO, "StuckAgentDetector: Running detection cycle. Total nodes: {0}", 
+        LOGGER.log(FINE, "StuckAgentDetector: Running detection cycle. Total nodes: {0}", 
                 jenkins.getNodes().size());
 
         int cplnAgentCount = 0;
@@ -108,12 +107,7 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         
         // Process each CPLN agent
         for (Node node : jenkins.getNodes()) {
-            LOGGER.log(FINE, "StuckAgentDetector: Checking node {0}, type: {1}", 
-                    new Object[]{node.getNodeName(), node.getClass().getSimpleName()});
-            
             if (!(node instanceof Agent)) {
-                LOGGER.log(FINE, "StuckAgentDetector: Node {0} is NOT a CPLN Agent, skipping", 
-                        node.getNodeName());
                 continue;
             }
             
@@ -123,16 +117,11 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
             Cloud cloud = agent.getCloud();
 
             if (cloud == null) {
-                LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} has null cloud, skipping", 
+                LOGGER.log(FINE, "StuckAgentDetector: Agent {0} has null cloud, skipping", 
                         node.getNodeName());
                 continue;
             }
 
-            // NOTE: We now check ALL agents, not just unique agents
-            // High response time or stalled channel is a problem regardless of agent type
-            LOGGER.log(INFO, "StuckAgentDetector: Checking CPLN agent {0} (unique={1})", 
-                    new Object[]{node.getNodeName(), cloud.getUseUniqueAgents()});
-            
             checkedCount++;
             checkAgentForStuckState(agent, cloud, jenkins);
         }
@@ -140,7 +129,7 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         // Clean up tracking for nodes that no longer exist
         potentiallyStuck.keySet().removeIf(name -> jenkins.getNode(name) == null);
 
-        LOGGER.log(INFO, "StuckAgentDetector: Completed. CPLN agents: {0}, Checked: {1}, Tracking: {2}",
+        LOGGER.log(FINE, "StuckAgentDetector: Completed. CPLN agents: {0}, Checked: {1}, Tracking: {2}",
                 new Object[]{cplnAgentCount, checkedCount, potentiallyStuck.size()});
     }
 
@@ -154,58 +143,38 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         hudson.model.Computer computer = jenkins.getComputer(nodeName);
 
         if (computer == null) {
-            LOGGER.log(INFO, "StuckAgentDetector: Computer for {0} is null", nodeName);
             potentiallyStuck.remove(nodeName);
             return;
         }
 
         // RULE 2: Agent must be "online"
-        // If it's offline, normal cleanup mechanisms should handle it
-        boolean isOffline = computer.isOffline();
-        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} online={1}", 
-                new Object[]{nodeName, !isOffline});
-        if (isOffline) {
+        if (computer.isOffline()) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} is OFFLINE, skipping", nodeName);
             return;
         }
 
-        // RULE 3: Agent must have NO busy executors
-        // If build is still running, this is not a stuck agent (StalledBuildDetector handles that)
-        boolean hasBusy = hasBusyExecutors(computer);
-        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} hasBusyExecutors={1}", 
-                new Object[]{nodeName, hasBusy});
-        if (hasBusy) {
+        // RULE 3: Agent must have NO busy executors (StalledBuildDetector handles busy agents)
+        if (hasBusyExecutors(computer)) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} has BUSY executors, delegating to StalledBuildDetector", nodeName);
             return;
         }
 
         // RULE 4: CPLN workload must still exist
-        // If workload is gone, different cleanup path handles it
-        boolean workloadExists = CplnCleanup.workloadExists(cloud, nodeName);
-        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} workloadExists={1}", 
-                new Object[]{nodeName, workloadExists});
-        if (!workloadExists) {
+        if (!CplnCleanup.workloadExists(cloud, nodeName)) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} workload DOESN'T EXIST, skipping", nodeName);
             return;
         }
 
         // RULE 5 & 6: Check for channel staleness indicators
         ChannelHealth channelHealth = assessChannelHealth(computer);
-        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} channelHealth={1}", 
-                new Object[]{nodeName, channelHealth});
         
         if (channelHealth == ChannelHealth.HEALTHY) {
-            // Channel is healthy, agent is not stuck
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} channel is HEALTHY, not stuck", nodeName);
             return;
         }
 
         // Agent appears to be in a potentially stuck state
-        LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} MATCHES stuck criteria! channelHealth={1}",
+        LOGGER.log(FINE, "StuckAgentDetector: Agent {0} potentially stuck, channelHealth={1}",
                 new Object[]{nodeName, channelHealth});
         
         // Track it and check if it's been stuck long enough
@@ -220,13 +189,13 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         long stuckDurationMs = Duration.between(info.firstDetected, Instant.now()).toMillis();
         
         if (stuckDurationMs < STUCK_GRACE_PERIOD_MS) {
-            LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} potentially stuck for {1}ms, waiting for grace period ({2}ms)",
+            LOGGER.log(FINE, "StuckAgentDetector: Agent {0} stuck for {1}ms, waiting for grace period ({2}ms)",
                     new Object[]{nodeName, stuckDurationMs, STUCK_GRACE_PERIOD_MS});
             return;
         }
 
         if (info.detectionCount < MIN_DETECTION_CYCLES) {
-            LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} detected {1} times, waiting for min cycles ({2})",
+            LOGGER.log(FINE, "StuckAgentDetector: Agent {0} detected {1} times, waiting for min cycles ({2})",
                     new Object[]{nodeName, info.detectionCount, MIN_DETECTION_CYCLES});
             return;
         }
@@ -262,70 +231,51 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
      */
     private ChannelHealth assessChannelHealth(hudson.model.Computer computer) {
         try {
-            // CRITICAL CHECK: Response time from Jenkins' ResponseTimeMonitor
-            // This is what Jenkins displays in the UI (e.g., "12980ms")
+            // Check response time from Jenkins' ResponseTimeMonitor
             long responseTime = getResponseTime(computer);
             if (responseTime > RESPONSE_TIME_THRESHOLD_MS) {
-                LOGGER.log(INFO, "Agent {0} has HIGH response time: {1}ms (threshold: {2}ms)",
-                        new Object[]{computer.getName(), responseTime, RESPONSE_TIME_THRESHOLD_MS});
+                LOGGER.log(FINE, "Agent {0} high response time: {1}ms", 
+                        new Object[]{computer.getName(), responseTime});
                 return ChannelHealth.HIGH_RESPONSE_TIME;
             }
             
             VirtualChannel virtualChannel = computer.getChannel();
             
             if (virtualChannel == null) {
-                // No channel - this is abnormal for an "online" agent
-                LOGGER.log(INFO, "Agent {0} has NO channel but appears online", computer.getName());
                 return ChannelHealth.NO_CHANNEL;
             }
 
-            // Check if the virtual channel is actually a Channel instance
-            // so we can call Channel-specific methods
             if (virtualChannel instanceof Channel) {
                 Channel channel = (Channel) virtualChannel;
                 
                 if (channel.isClosingOrClosed()) {
-                    // Channel is closing but agent still appears online
-                    LOGGER.log(INFO, "Agent {0} channel is closing/closed", computer.getName());
                     return ChannelHealth.CLOSING;
                 }
 
-                // Check last heartbeat if available
-                // Note: Heartbeat tracking depends on Jenkins/remoting version
-                // If we can't get heartbeat info, we rely on other indicators
                 long lastHeartbeat = getLastHeartbeat(channel);
                 if (lastHeartbeat > 0) {
                     long heartbeatAge = System.currentTimeMillis() - lastHeartbeat;
                     if (heartbeatAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(INFO, "Agent {0} channel heartbeat is stale: {1}ms old",
-                                new Object[]{computer.getName(), heartbeatAge});
                         return ChannelHealth.STALE_HEARTBEAT;
                     }
                 }
             }
 
-            // If computer is a CPLN Computer, check our internal tracking
             if (computer instanceof Computer) {
                 Computer cplnComputer = (Computer) computer;
                 long lastActivity = cplnComputer.getLastActivityTime();
                 if (lastActivity > 0) {
                     long activityAge = System.currentTimeMillis() - lastActivity;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(INFO, "Agent {0} no channel activity for {1}ms",
-                                new Object[]{computer.getName(), activityAge});
                         return ChannelHealth.NO_ACTIVITY;
                     }
                 }
             }
 
-            LOGGER.log(FINE, "Agent {0} channel appears healthy (response time: {1}ms)",
-                    new Object[]{computer.getName(), responseTime});
             return ChannelHealth.HEALTHY;
 
         } catch (Exception e) {
-            LOGGER.log(WARNING, "Error assessing channel health for {0}: {1}",
-                    new Object[]{computer.getName(), e.getMessage()});
-            // If we can't assess, assume healthy to avoid false positives
+            LOGGER.log(FINE, "Error assessing channel health: {0}", e.getMessage());
             return ChannelHealth.HEALTHY;
         }
     }

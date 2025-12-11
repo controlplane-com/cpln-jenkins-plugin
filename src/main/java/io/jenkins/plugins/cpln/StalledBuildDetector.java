@@ -107,51 +107,34 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
     protected void execute(TaskListener listener) {
         Jenkins jenkins = Jenkins.getInstanceOrNull();
         if (jenkins == null) {
-            LOGGER.log(WARNING, "StalledBuildDetector: Jenkins instance is null, skipping");
             return;
         }
 
-        LOGGER.log(INFO, "StalledBuildDetector: Running detection cycle. Total nodes: {0}", 
-                jenkins.getNodes().size());
+        LOGGER.log(FINE, "StalledBuildDetector: Running detection cycle");
 
-        int cplnAgentCount = 0;
-        int checkedCount = 0;
-        
         // Process each CPLN agent
         for (Node node : jenkins.getNodes()) {
-            LOGGER.log(FINE, "StalledBuildDetector: Checking node {0}, type: {1}", 
-                    new Object[]{node.getNodeName(), node.getClass().getSimpleName()});
-            
             if (!(node instanceof Agent)) {
-                LOGGER.log(FINE, "StalledBuildDetector: Node {0} is NOT a CPLN Agent (type: {1}), skipping", 
-                        new Object[]{node.getNodeName(), node.getClass().getName()});
                 continue;
             }
-            
-            cplnAgentCount++;
 
             Agent agent = (Agent) node;
             Cloud cloud = agent.getCloud();
 
             if (cloud == null) {
-                LOGGER.log(WARNING, "StalledBuildDetector: Agent {0} has null cloud, skipping", 
-                        node.getNodeName());
                 continue;
             }
 
-            LOGGER.log(INFO, "StalledBuildDetector: Checking CPLN agent {0}", node.getNodeName());
-            checkedCount++;
             checkAgentForStalledBuilds(agent, cloud, jenkins);
         }
 
         // Clean up tracking for nodes that no longer exist
         potentiallyStalled.keySet().removeIf(name -> {
-            String nodeName = name.split(":")[0]; // Format: "nodeName:executorIndex"
+            String nodeName = name.split(":")[0];
             return jenkins.getNode(nodeName) == null;
         });
 
-        LOGGER.log(INFO, "StalledBuildDetector: Completed. CPLN agents: {0}, Checked: {1}, Tracking: {2}",
-                new Object[]{cplnAgentCount, checkedCount, potentiallyStalled.size()});
+        LOGGER.log(FINE, "StalledBuildDetector: Completed. Tracking: {0}", potentiallyStalled.size());
     }
 
     /**
@@ -190,58 +173,42 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
                                                hudson.model.Computer computer, String nodeName) {
         
         // RULE 2: Executor must be busy
-        // If not busy, StuckAgentDetector handles cleanup
         if (!executor.isBusy()) {
             String key = buildKey(nodeName, executor);
             potentiallyStalled.remove(key);
-            LOGGER.log(FINE, "Agent {0} executor not busy, skipping stalled build check", nodeName);
             return;
         }
 
         Queue.Executable executable = executor.getCurrentExecutable();
         if (executable == null) {
-            LOGGER.log(FINE, "Agent {0} has busy executor but no executable", nodeName);
             return;
         }
 
         String key = buildKey(nodeName, executor);
-        String buildName = getBuildName(executable);
-        
-        LOGGER.log(INFO, "Checking agent {0} for stalled build: {1}", new Object[]{nodeName, buildName});
 
         // RULE 3: Check log quiet period
-        // If logs are still being written, build is still active
         long logQuietTime = getLogQuietTime(executable);
-        LOGGER.log(INFO, "Agent {0} log quiet time: {1}ms (threshold: {2}ms)",
-                new Object[]{nodeName, logQuietTime, LOG_QUIET_PERIOD_MS});
         
         if (logQuietTime < LOG_QUIET_PERIOD_MS) {
-            // Logs are recent, build is still producing output
             potentiallyStalled.remove(key);
-            LOGGER.log(INFO, "Agent {0} has recent log output ({1}ms ago), NOT stalled",
-                    new Object[]{nodeName, logQuietTime});
             return;
         }
 
         // RULE 4: Check channel staleness / response time
         ChannelStatus channelStatus = assessChannelStatus(computer);
-        LOGGER.log(INFO, "Agent {0} channel status: {1}", new Object[]{nodeName, channelStatus});
         
         if (channelStatus == ChannelStatus.HEALTHY) {
             potentiallyStalled.remove(key);
-            LOGGER.log(INFO, "Agent {0} channel is HEALTHY, NOT stalled", nodeName);
             return;
         }
 
         // RULE 5: Check CPLN workload is still running
-        // If workload crashed, other mechanisms handle cleanup
         if (!isWorkloadRunningHealthy(cloud, nodeName)) {
             potentiallyStalled.remove(key);
-            LOGGER.log(INFO, "Agent {0} workload not running healthy, skipping stalled detection", nodeName);
             return;
         }
         
-        LOGGER.log(INFO, "Agent {0} MATCHES stalled criteria: logQuiet={1}ms, channelStatus={2}",
+        LOGGER.log(FINE, "Agent {0} potentially stalled: logQuiet={1}ms, channelStatus={2}",
                 new Object[]{nodeName, logQuietTime, channelStatus});
 
         // All criteria met - this build may be stalled
@@ -321,23 +288,17 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
 
     /**
      * Assess the status of the computer's remoting channel.
-     * Checks multiple indicators: response time, channel state, and activity tracking.
      */
     private ChannelStatus assessChannelStatus(hudson.model.Computer computer) {
         try {
-            // CRITICAL CHECK: Response time from Jenkins' ResponseTimeMonitor
-            // This is what Jenkins displays in the UI (e.g., "12980ms")
             long responseTime = getResponseTime(computer);
             if (responseTime > RESPONSE_TIME_THRESHOLD_MS) {
-                LOGGER.log(INFO, "Agent {0} has HIGH response time: {1}ms (threshold: {2}ms)",
-                        new Object[]{computer.getName(), responseTime, RESPONSE_TIME_THRESHOLD_MS});
                 return ChannelStatus.HIGH_RESPONSE_TIME;
             }
             
             VirtualChannel virtualChannel = computer.getChannel();
             
             if (virtualChannel == null) {
-                LOGGER.log(INFO, "Agent {0} has NO channel but appears online", computer.getName());
                 return ChannelStatus.NO_CHANNEL;
             }
 
@@ -345,44 +306,34 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
                 Channel channel = (Channel) virtualChannel;
                 
                 if (channel.isClosingOrClosed()) {
-                    LOGGER.log(INFO, "Agent {0} channel is closing/closed", computer.getName());
                     return ChannelStatus.CLOSING;
                 }
 
-                // Try to get last activity time from channel
                 long lastHeard = getChannelLastHeard(channel);
                 if (lastHeard > 0) {
                     long activityAge = System.currentTimeMillis() - lastHeard;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(INFO, "Agent {0} channel stale: no activity for {1}ms",
-                                new Object[]{computer.getName(), activityAge});
                         return ChannelStatus.STALE;
                     }
                 }
             }
 
-            // Check CPLN Computer's activity tracking
             if (computer instanceof Computer) {
                 Computer cplnComputer = (Computer) computer;
                 long lastActivity = cplnComputer.getLastActivityTime();
                 if (lastActivity > 0) {
                     long activityAge = System.currentTimeMillis() - lastActivity;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(INFO, "Agent {0} CPLN activity stale: no activity for {1}ms",
-                                new Object[]{computer.getName(), activityAge});
                         return ChannelStatus.STALE;
                     }
                 }
             }
 
-            LOGGER.log(FINE, "Agent {0} channel appears healthy (response time: {1}ms)",
-                    new Object[]{computer.getName(), responseTime});
             return ChannelStatus.HEALTHY;
 
         } catch (Exception e) {
-            LOGGER.log(WARNING, "Error assessing channel for {0}: {1}",
-                    new Object[]{computer.getName(), e.getMessage()});
-            return ChannelStatus.HEALTHY; // Assume healthy on error to avoid false positives
+            LOGGER.log(FINE, "Error assessing channel: {0}", e.getMessage());
+            return ChannelStatus.HEALTHY;
         }
     }
 
@@ -424,20 +375,40 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
     }
 
     /**
-     * Check if the CPLN workload is running and healthy.
-     * If it's crashed or restarting, other mechanisms handle it.
+     * Check if the CPLN workload still exists and is running (even if unhealthy).
+     * 
+     * We only skip stalled detection if the workload is:
+     * - TERMINATED (already stopped)
+     * - CRASHED (other mechanisms handle it)
+     * - OOM_KILLED (other mechanisms handle it)
+     * - NOT_FOUND (already deleted)
+     * 
+     * We DO trigger stalled detection if the workload is:
+     * - HEALTHY (running normally - might be stalled)
+     * - UNHEALTHY (running but in bad state - might be stalled)
+     * - UNKNOWN (can't determine - assume still running)
      */
     private boolean isWorkloadRunningHealthy(Cloud cloud, String workloadName) {
         try {
             WorkloadReconciler.WorkloadHealthStatus status = 
                     getWorkloadHealthStatus(cloud, workloadName);
             
-            return status == WorkloadReconciler.WorkloadHealthStatus.HEALTHY ||
-                   status == WorkloadReconciler.WorkloadHealthStatus.UNKNOWN;
+            // Only skip if workload is definitely dead or gone
+            if (status == WorkloadReconciler.WorkloadHealthStatus.TERMINATED ||
+                status == WorkloadReconciler.WorkloadHealthStatus.CRASHED ||
+                status == WorkloadReconciler.WorkloadHealthStatus.OOM_KILLED ||
+                status == WorkloadReconciler.WorkloadHealthStatus.NOT_FOUND) {
+                LOGGER.log(FINE, "Agent {0} workload is {1}, skipping stalled detection",
+                        new Object[]{workloadName, status});
+                return false;
+            }
+            
+            // HEALTHY, UNHEALTHY, or UNKNOWN - workload is still running
+            return true;
                    
         } catch (Exception e) {
             LOGGER.log(FINE, "Error checking workload health: {0}", e.getMessage());
-            return true; // Assume healthy on error
+            return true;
         }
     }
 
