@@ -19,6 +19,13 @@ import static io.jenkins.plugins.cpln.Utils.*;
 import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.WARNING;
 
+/**
+ * Launcher implementation for CPLN agents.
+ * 
+ * This launcher creates CPLN workloads and ensures proper cleanup tracking.
+ * The workload creation is wrapped with proper error handling to ensure
+ * cleanup happens even if the launch process fails.
+ */
 public class Launcher extends JNLPLauncher {
 
     private static final Logger LOGGER = Logger.getLogger(Launcher.class.getName());
@@ -39,12 +46,13 @@ public class Launcher extends JNLPLauncher {
 
     @Override
     @SuppressFBWarnings
-    public synchronized void launch(SlaveComputer computer, TaskListener listener) {
-        if (!(computer instanceof Computer)) {
+    public synchronized void launch(SlaveComputer slaveComputer, TaskListener listener) {
+        if (!(slaveComputer instanceof Computer)) {
             throw new IllegalArgumentException("Invalid Cpln Computer Specification");
         }
 
-        Agent node = ((Computer)computer).getNode();
+        Computer computer = (Computer) slaveComputer;
+        Agent node = computer.getNode();
         if (node == null) {
             throw new IllegalStateException("No node for computer " + computer.getName());
         }
@@ -53,28 +61,56 @@ public class Launcher extends JNLPLauncher {
             return;
         }
 
-        Cloud cloud = ((Agent) computer.getNode()).getCloud();
+        Cloud cloud = node.getCloud();
+        String workloadName = computer.getName();
+        boolean workloadCreated = false;
+        
         try {
-            if(Objects.isNull(cloud)){
+            if (Objects.isNull(cloud)) {
+                LOGGER.log(WARNING, "Cloud is null for computer {0}, cannot launch", workloadName);
                 return;
             }
+            
             LOGGER.log(INFO, "Attempting to launch workload on cloud {0} with workload {1}...",
-                    new Object[]{cloud, computer.getName()});
+                    new Object[]{cloud, workloadName});
 
-            if(allowLaunch(cloud, computer)) {
-                if(createWorkload(cloud, computer)){
+            if (allowLaunch(cloud, computer)) {
+                workloadCreated = createWorkload(cloud, computer);
+                
+                if (workloadCreated) {
+                    // Mark workload as provisioned for cleanup tracking
+                    computer.setWorkloadProvisioned(true);
                     computer.setAcceptingTasks(true);
                     launched = true;
+                    
+                    // Track with reconciler
+                    WorkloadReconciler.trackWorkload(workloadName, cloud.name, null);
+                    
                     LOGGER.log(INFO, "Workload agent successfully deployed on cloud {0} with workload {1} - retention {2} min(s)",
-                            new Object[]{cloud, computer.getName(), cloud.getRetentionMins()});
+                            new Object[]{cloud, workloadName, cloud.getRetentionMins()});
+                } else {
+                    LOGGER.log(WARNING, "Failed to create workload {0} on cloud {1}", 
+                            new Object[]{workloadName, cloud});
                 }
             } else {
+                // Workload already exists - this can happen with shared (non-unique) agents
+                // Mark as provisioned and accepting tasks, the agent should connect via WebSocket
+                computer.setWorkloadProvisioned(true);
+                computer.setAcceptingTasks(true);
+                // Don't set launched = true here - this allows Jenkins to retry if needed
+                
                 LOGGER.log(INFO, "Found workload agent already deployed on cloud {0} with workload {1}...",
-                        new Object[]{cloud, computer.getName()});
+                        new Object[]{cloud, workloadName});
             }
         } catch (Exception e) {
             LOGGER.log(WARNING, "Workload provisioning failed for {0}: {1}",
-                    new Object[]{cloud, e});
+                    new Object[]{cloud, e.getMessage()});
+            
+            // If workload was created but something failed after, ensure cleanup
+            if (workloadCreated && cloud != null) {
+                LOGGER.log(INFO, "Scheduling cleanup for failed launch of workload {0}", workloadName);
+                CplnCleanupListener.forceCleanup(workloadName, cloud, "launch exception: " + e.getMessage());
+            }
         }
     }
 
@@ -102,19 +138,19 @@ public class Launcher extends JNLPLauncher {
         boolean hasAgentContainer = false;
         if (response.statusCode() == 200) {
             Workload workload = readGetWorkload(response.body());
-            for(Container container : workload.spec.containers){
-                if(AGENT_IMAGE.equals(container.image)) {
+            for (Container container : workload.spec.containers) {
+                if (AGENT_IMAGE.equals(container.image)) {
                     hasAgentImage = true;
                 }
-                if(AGENT_CONTAINER.equals(container.name)){
+                if (AGENT_CONTAINER.equals(container.name)) {
                     hasAgentContainer = true;
                 }
             }
-            if(!hasAgentImage) {
+            if (!hasAgentImage) {
                 LOGGER.log(WARNING, "Workload at {0} should have an agent image: {1}",
                         new Object[]{cloud, AGENT_IMAGE});
             }
-            if(!hasAgentContainer){
+            if (!hasAgentContainer) {
                 LOGGER.log(WARNING, "Workload at {0} should have a container name : {1}",
                         new Object[]{cloud, AGENT_CONTAINER});
             }
@@ -128,7 +164,7 @@ public class Launcher extends JNLPLauncher {
     @SuppressFBWarnings
     private boolean createWorkload(Cloud cloud, SlaveComputer computer) {
         String workloadBody = Utils.resolveWorkloadTemplate(cloud, computer);
-        if(Strings.isNullOrEmpty(workloadBody)) {
+        if (Strings.isNullOrEmpty(workloadBody)) {
             return false;
         }
         try {

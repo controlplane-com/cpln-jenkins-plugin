@@ -1,4 +1,17 @@
 <div>
-    Optional. The name of the volume set automatically mounted in the agent workload container in the selected gvc.
-    If the empty option is selected, the volume set path must also be empty. More details on <a href="https://docs.controlplane.com/reference/volumeset">Volume Sets</a>
+    <p>
+        Optionally specify a Control Plane Volume Set to attach to the agent container.
+    </p>
+    <p>
+        <strong>Important:</strong> The volume must be of type <code>shared</code>. 
+        Volumes of type <code>ext4</code> or <code>xfs</code> are NOT supported because they 
+        cannot be mounted by multiple agents simultaneously and are not compatible with standard workloads.
+    </p>
+    <p>
+        Volume Sets allow you to persist data between builds or share data across agents.
+    </p>
+    <p>
+        If specified, you must also provide a <strong>Volume Set Path</strong> where the 
+        volume will be mounted inside the container.
+    </p>
 </div>

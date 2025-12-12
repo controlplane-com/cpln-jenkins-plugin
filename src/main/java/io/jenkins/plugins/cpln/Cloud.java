@@ -3,6 +3,7 @@ package io.jenkins.plugins.cpln;
 import static io.jenkins.plugins.cpln.Utils.*;
 import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.WARNING;
+import static java.util.logging.Level.FINE;
 
 import com.google.common.base.Strings;
 import edu.umd.cs.findbugs.annotations.NonNull;
@@ -22,8 +23,10 @@ import io.jenkins.plugins.cpln.model.*;
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.http.HttpResponse;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -32,6 +35,25 @@ import java.util.stream.Stream;
 import jenkins.model.Jenkins;
 import org.kohsuke.stapler.*;
 
+/**
+ * CPLN Cloud implementation for Jenkins.
+ * 
+ * This cloud provisions Jenkins agents as CPLN workloads. Cleanup of workloads
+ * is handled through multiple mechanisms to ensure robustness:
+ * 
+ * 1. Agent._terminate() - Called by Jenkins retention strategy for graceful termination
+ * 2. CplnCleanupListener - Handles abnormal disconnections and connection failures
+ * 3. WorkloadReconciler - Periodic background cleanup of orphan workloads
+ * 
+ * This ensures workloads are cleaned up regardless of:
+ * - Handshake failures
+ * - ClosedChannelException
+ * - Missing X-Remoting-Capability headers
+ * - OOM kills
+ * - Fast exits
+ * - Abnormal websocket terminations
+ * - Jenkins controller restarts
+ */
 @SuppressFBWarnings
 public class Cloud extends hudson.slaves.Cloud {
 
@@ -39,6 +61,10 @@ public class Cloud extends hudson.slaves.Cloud {
 
     private static final String LIST_CHOOSE = "-- Choose one --";
     private static final String LIST_NO_ITEM = "no-item-present";
+    
+    // Track pending provisions to prevent over-provisioning with unique agents
+    // Key: cloud name + label, Value: timestamp of last provision
+    private static final ConcurrentHashMap<String, Instant> pendingProvisions = new ConcurrentHashMap<>();
 
     private String org;
 
@@ -59,6 +85,10 @@ public class Cloud extends hudson.slaves.Cloud {
     private int memory;
 
     private int retentionMins;
+    
+    // Cooldown period between provisions for unique agents (in seconds)
+    // This prevents Jenkins from provisioning multiple agents before the first one connects
+    private int provisioningCooldownSecs;
 
     private String agentImage;
 
@@ -86,6 +116,7 @@ public class Cloud extends hudson.slaves.Cloud {
                  int cpu,
                  int memory,
                  int retentionMins,
+                 int provisioningCooldownSecs,
                  String agentImage,
                  String volumeSetName,
                  String volumeSetPath,
@@ -103,6 +134,7 @@ public class Cloud extends hudson.slaves.Cloud {
         this.cpu = cpu;
         this.memory = memory;
         this.retentionMins = retentionMins;
+        this.provisioningCooldownSecs = provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
         this.agentImage = agentImage;
         this.volumeSetName = volumeSetName;
         this.volumeSetPath = volumeSetPath;
@@ -219,6 +251,16 @@ public class Cloud extends hudson.slaves.Cloud {
     public void setRetentionMins(int retentionMins) {
         this.retentionMins = retentionMins;
     }
+    
+    public int getProvisioningCooldownSecs() {
+        return provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
+    }
+
+    @DataBoundSetter
+    @SuppressWarnings("unused")
+    public void setProvisioningCooldownSecs(int provisioningCooldownSecs) {
+        this.provisioningCooldownSecs = provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
+    }
 
     @DataBoundSetter
     @SuppressWarnings("unused")
@@ -292,15 +334,15 @@ public class Cloud extends hudson.slaves.Cloud {
         // configuring the cloud with no executors prevents new jobs from
         // being assigned to agents of this cloud. Updating the executor number to > 0
         // results in any already waiting job being able to run on agents of this cloud again.
-        if(getExecutors() == 0){
+        if (getExecutors() == 0) {
             return Collections.emptyList();
         }
 
         String label;
         Stream<Node> nodes;
-        if(Objects.nonNull(state.getLabel())) {
+        if (Objects.nonNull(state.getLabel())) {
             label = state.getLabel().getName();
-            if(!state.getLabel().matches(getLabelAtoms())){
+            if (!state.getLabel().matches(getLabelAtoms())) {
                 LOGGER.log(WARNING, "Label {0} not supported by {1}. Use one of '{2}'",
                         new Object[]{label, this, getLabels()});
                 return Collections.emptyList();
@@ -316,16 +358,83 @@ public class Cloud extends hudson.slaves.Cloud {
 
         int realExcessWorkload = 1;
         Set<Node> nodeSet = new LinkedHashSet<>();
-        if(!getUseUniqueAgents()) {
+        if (!getUseUniqueAgents()) {
             final String agentNameUnlabeled = agentNameBase;
+            
+            // CRITICAL SAFETY CHECK: Before reusing any existing node, verify its workload exists
+            // This prevents scheduling builds on stale nodes whose workloads were deleted
+            Node existingNode = Jenkins.get().getNode(agentNameUnlabeled);
+            if (existingNode != null && existingNode instanceof Agent) {
+                if (!CplnCleanup.workloadExists(this, agentNameUnlabeled)) {
+                    LOGGER.log(WARNING, "Node {0} has no backing workload. Removing stale node before provisioning.",
+                            agentNameUnlabeled);
+                    CplnCleanup.removeNodeSync(agentNameUnlabeled);
+                    // Don't add this stale node to nodeSet
+                    existingNode = null;
+                }
+            }
+            
             nodes = nodes.filter(Agent.class::isInstance)
                     .filter(Node::isAcceptingTasks)
-                    .filter(n -> n.getNodeName().equals(agentNameUnlabeled));
+                    .filter(n -> n.getNodeName().equals(agentNameUnlabeled))
+                    // Additional filter: only include nodes whose workloads exist
+                    .filter(n -> {
+                        if (CplnCleanup.workloadExists(this, n.getNodeName())) {
+                            return true;
+                        } else {
+                            LOGGER.log(WARNING, "Filtering out node {0} - no backing workload exists", n.getNodeName());
+                            // Schedule async removal of this stale node
+                            CplnCleanup.removeNodeSync(n.getNodeName());
+                            return false;
+                        }
+                    });
             nodeSet = nodes.collect(Collectors.toSet());
         } else {
-            realExcessWorkload = excessWorkload;
+            // For unique agents, we need to be smarter about provisioning
+            // Don't just provision excessWorkload agents, but consider what's already pending
+            int pendingAgents = countPendingAgents(label);
+            int onlineAgents = countOnlineAgents(label);
+            
+            // Calculate how many agents we actually need
+            // excessWorkload is how many MORE executors Jenkins wants
+            // We should provision to meet that demand, minus what's already pending
+            int effectiveExcess = excessWorkload - pendingAgents;
+            
+            if (effectiveExcess <= 0) {
+                LOGGER.log(INFO, "Skipping provision for {0} - {1} agent(s) already pending, excess={2}",
+                        new Object[]{this, pendingAgents, excessWorkload});
+                return Collections.emptyList();
+            }
+            
+            // Apply cooldown: only provision one agent at a time with cooldown between
+            String cooldownKey = name + ":" + label;
+            Instant lastProvision = pendingProvisions.get(cooldownKey);
+            if (lastProvision != null) {
+                long secondsSinceLastProvision = java.time.Duration.between(lastProvision, Instant.now()).getSeconds();
+                if (secondsSinceLastProvision < getProvisioningCooldownSecs()) {
+                    // Still in cooldown, but if we have a lot of demand, provision anyway
+                    // This allows scaling up quickly when there's real demand
+                    if (pendingAgents == 0 && effectiveExcess > 1) {
+                        LOGGER.log(INFO, "Provisioning despite cooldown for {0} - high demand ({1} excess, 0 pending)",
+                                new Object[]{this, effectiveExcess});
+                        // Allow 1 provision
+                        realExcessWorkload = 1;
+                    } else {
+                        LOGGER.log(FINE, "Skipping provision for {0} - within cooldown period ({1}s since last provision)",
+                                new Object[]{this, secondsSinceLastProvision});
+                        return Collections.emptyList();
+                    }
+                } else {
+                    // Cooldown expired, provision based on effective excess (but cap at 1 per cycle)
+                    realExcessWorkload = 1;
+                }
+            } else {
+                // No cooldown active, provision 1 agent
+                realExcessWorkload = 1;
+            }
         }
-        if(!getUseUniqueAgents() && !nodeSet.isEmpty()) {
+        
+        if (!getUseUniqueAgents() && !nodeSet.isEmpty()) {
             String labelInfo = label.isEmpty() ? "no label" : String.format("label: %s", label);
             LOGGER.log(INFO, "Agent found for {0}: {1} for tasks with {2}",
                     new Object[]{this, nodeSet.iterator().next().getNodeName(), labelInfo});
@@ -333,22 +442,39 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         // if the cloud has labels, it can choose to take or not to take unlabeled jobs
-        if(label.isEmpty() && !Strings.isNullOrEmpty(getLabels()) && !getAllowJobsWithoutLabels()){
+        if (label.isEmpty() && !Strings.isNullOrEmpty(getLabels()) && !getAllowJobsWithoutLabels()) {
             return Collections.emptyList();
         }
 
         try {
             Set<NodeProvisioner.PlannedNode> plannedNodes = new LinkedHashSet<>();
-            while(realExcessWorkload-- > 0) {
+            
+            // For unique agents, only provision one at a time to prevent over-provisioning
+            int toProvision = getUseUniqueAgents() ? 1 : realExcessWorkload;
+            
+            while (toProvision-- > 0) {
                 String agentName = getAgentName(agentNameBase);
                 Agent agent = new Agent(agentName, "", new Launcher());
                 agent.setCloud(this);
                 agent.setLabelString(label);
                 agent.setNumExecutors(getExecutors());
                 agent.setRetentionStrategy(new CloudRetentionStrategy(getRetentionMins()));
+                
+                // Track the workload for reconciliation
+                WorkloadReconciler.trackWorkload(agentName, this.name, null);
+                
+                // Update cooldown timestamp for unique agents
+                if (getUseUniqueAgents()) {
+                    String cooldownKey = name + ":" + label;
+                    pendingProvisions.put(cooldownKey, Instant.now());
+                }
+                
                 NodeProvisioner.PlannedNode node = new NodeProvisioner.PlannedNode(
                         name, CompletableFuture.completedFuture(agent), getExecutors());
                 plannedNodes.add(node);
+                
+                LOGGER.log(INFO, "Provisioning agent {0} for cloud {1}",
+                        new Object[]{agentName, this});
             }
             return plannedNodes;
         } catch (Descriptor.FormException | IOException e) {
@@ -356,6 +482,69 @@ public class Cloud extends hudson.slaves.Cloud {
                     new Object[]{this, e});
             return Collections.emptyList();
         }
+    }
+    
+    /**
+     * Count agents for this cloud that are pending (not yet online).
+     */
+    private int countPendingAgents(String label) {
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return 0;
+        
+        int pending = 0;
+        for (Node node : jenkins.getNodes()) {
+            if (node instanceof Agent) {
+                Agent agent = (Agent) node;
+                if (agent.getCloud() != null && name.equals(agent.getCloud().name)) {
+                    // Check if labels match
+                    String agentLabel = agent.getLabelString();
+                    if ((label.isEmpty() && Strings.isNullOrEmpty(agentLabel)) ||
+                        label.equals(agentLabel)) {
+                        hudson.model.Computer computer = agent.toComputer();
+                        if (computer != null && !computer.isOnline()) {
+                            pending++;
+                        }
+                    }
+                }
+            }
+        }
+        return pending;
+    }
+    
+    /**
+     * Count agents for this cloud that are online.
+     */
+    private int countOnlineAgents(String label) {
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return 0;
+        
+        int online = 0;
+        for (Node node : jenkins.getNodes()) {
+            if (node instanceof Agent) {
+                Agent agent = (Agent) node;
+                if (agent.getCloud() != null && name.equals(agent.getCloud().name)) {
+                    // Check if labels match
+                    String agentLabel = agent.getLabelString();
+                    if ((label.isEmpty() && Strings.isNullOrEmpty(agentLabel)) ||
+                        label.equals(agentLabel)) {
+                        hudson.model.Computer computer = agent.toComputer();
+                        if (computer != null && computer.isOnline()) {
+                            online++;
+                        }
+                    }
+                }
+            }
+        }
+        return online;
+    }
+    
+    /**
+     * Clear the cooldown for this cloud (called when an agent comes online).
+     */
+    public static void clearProvisioningCooldown(String cloudName, String label) {
+        String cooldownKey = cloudName + ":" + (label != null ? label : "");
+        pendingProvisions.remove(cooldownKey);
+        LOGGER.log(FINE, "Cleared provisioning cooldown for {0}", cooldownKey);
     }
 
     @SuppressWarnings("unused")
@@ -365,7 +554,7 @@ public class Cloud extends hudson.slaves.Cloud {
     }
 
     private String getAgentName(String agentNameBase) {
-        if(getUseUniqueAgents()) {
+        if (getUseUniqueAgents()) {
             String uniqueSuffix = String.format("-%s",
                     UUID.randomUUID().toString().substring(0, 8));
             return String.format("%s%s", agentNameBase, uniqueSuffix);
@@ -393,7 +582,7 @@ public class Cloud extends hudson.slaves.Cloud {
 
         public ListBoxModel doFillOrgItems(@AncestorInPath ItemGroup owner,
                                             @QueryParameter Secret apiKey) {
-            if(Objects.isNull(apiKey) || Strings.isNullOrEmpty(apiKey.getPlainText())) {
+            if (Objects.isNull(apiKey) || Strings.isNullOrEmpty(apiKey.getPlainText())) {
                 return new ListBoxModel();
             }
 
@@ -424,7 +613,7 @@ public class Cloud extends hudson.slaves.Cloud {
         public ListBoxModel doFillGvcItems(@AncestorInPath ItemGroup owner,
                                             @QueryParameter String org,
                                             @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org)) {
+            if (Strings.isNullOrEmpty(org)) {
                 return new ListBoxModel();
             }
 
@@ -470,7 +659,7 @@ public class Cloud extends hudson.slaves.Cloud {
                                            @QueryParameter String org,
                                            @QueryParameter String gvc,
                                            @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
+            if (Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
                 return new ListBoxModel();
             }
 
@@ -505,7 +694,7 @@ public class Cloud extends hudson.slaves.Cloud {
                                                      @QueryParameter String org,
                                                      @QueryParameter String gvc,
                                                      @QueryParameter Secret apiKey) {
-            if(Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
+            if (Strings.isNullOrEmpty(org) || Strings.isNullOrEmpty(gvc)) {
                 return new ListBoxModel();
             }
 
@@ -537,18 +726,18 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckGvc(@QueryParameter String org, @QueryParameter String gvc) {
-            if(orgGvcLocations.isEmpty()) {
+            if (orgGvcLocations.isEmpty()) {
                 return FormValidation.ok();
             }
             Map<String, List<String>> orgMap = orgGvcLocations.get(org);
-            if(orgMap == null || orgMap.isEmpty()) {
+            if (orgMap == null || orgMap.isEmpty()) {
                 return FormValidation.ok();
             }
             List<String> gvcLocations = orgMap.get(gvc);
-            if(gvcLocations == null || gvcLocations.isEmpty()){
+            if (gvcLocations == null || gvcLocations.isEmpty()) {
                 return FormValidation.ok();
             }
-            if(gvcLocations.size() == 1){
+            if (gvcLocations.size() == 1) {
                 return FormValidation.ok();
             }
             return FormValidation.error(
@@ -557,7 +746,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckAgentWorkload(@QueryParameter String agentWorkload) {
-            if(!workloadPattern.matcher(agentWorkload).matches()){
+            if (!workloadPattern.matcher(agentWorkload).matches()) {
                 return FormValidation
                         .error(String.format("Agent Workload must be of form %s, " +
                                 "e.g. myjenkins-east-coast-tester", workloadPattern.pattern()));
@@ -566,7 +755,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckLabels(@QueryParameter String labels) {
-            if(!labelPattern.matcher(labels).matches()){
+            if (!labelPattern.matcher(labels).matches()) {
                 return FormValidation
                         .error(String.format("Labels must be of form %s, " +
                                 "e.g. 'label1' or 'label1 label2 linux-high-load' without the quotes",
@@ -576,7 +765,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckExecutors(@QueryParameter int executors) {
-            if(executors < 0){
+            if (executors < 0) {
                 return FormValidation
                         .error(String.format("The # of executors must be a non-negative integer, found %d", executors));
             }
@@ -584,32 +773,53 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckCpu(@QueryParameter int cpu) {
-            if(cpu <= 0){
+            if (cpu < Utils.MIN_CPU_MILLICORES) {
                 return FormValidation
-                        .error(String.format("The CPU millicores must be a positive integer, found %d", cpu));
+                        .error(String.format("CPU must be at least %dm for the Jenkins agent to start. Found: %dm", 
+                                Utils.MIN_CPU_MILLICORES, cpu));
+            }
+            if (cpu < Utils.RECOMMENDED_CPU_MILLICORES) {
+                return FormValidation
+                        .warning(String.format("CPU below %dm may cause slow agent startup or failures. Recommended: %dm or higher.", 
+                                Utils.RECOMMENDED_CPU_MILLICORES, Utils.RECOMMENDED_CPU_MILLICORES));
             }
             return FormValidation.ok();
         }
 
-        public FormValidation doChecMemory(@QueryParameter int memory) {
-            if(memory <= 0){
+        public FormValidation doCheckMemory(@QueryParameter int memory) {
+            if (memory < Utils.MIN_MEMORY_MEBIBYTES) {
                 return FormValidation
-                        .error(String.format("The Memory mebibytes must be a positive integer, found %d", memory));
+                        .error(String.format("Memory must be at least %dMi for the Jenkins agent to start. Found: %dMi", 
+                                Utils.MIN_MEMORY_MEBIBYTES, memory));
+            }
+            if (memory < Utils.RECOMMENDED_MEMORY_MEBIBYTES) {
+                return FormValidation
+                        .warning(String.format("Memory below %dMi may cause agent OOM or startup failures. Recommended: %dMi or higher.", 
+                                Utils.RECOMMENDED_MEMORY_MEBIBYTES, Utils.RECOMMENDED_MEMORY_MEBIBYTES));
             }
             return FormValidation.ok();
         }
 
         public FormValidation doCheckRetentionMins(@QueryParameter int retentionMins) {
-            if(retentionMins < 1){
+            if (retentionMins < 1) {
                 return FormValidation
                         .error(String.format("The Idle Agent Retention Time must be >= 1 minute, found %d",
                                 retentionMins));
             }
             return FormValidation.ok();
         }
+        
+        public FormValidation doCheckProvisioningCooldownSecs(@QueryParameter int provisioningCooldownSecs) {
+            if (provisioningCooldownSecs < 0) {
+                return FormValidation
+                        .error(String.format("The Provisioning Cooldown must be >= 0 seconds, found %d",
+                                provisioningCooldownSecs));
+            }
+            return FormValidation.ok();
+        }
 
         public FormValidation doCheckAgentImage(@QueryParameter String agentImage) {
-            if(Strings.isNullOrEmpty(agentImage)){
+            if (Strings.isNullOrEmpty(agentImage)) {
                 return FormValidation
                         .error("The Jenkins Agent Image cannot be empty");
             }
@@ -617,8 +827,8 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckVolumeSetPath(@QueryParameter String volumeSetName, @QueryParameter String volumeSetPath) {
-            if((Strings.isNullOrEmpty(volumeSetName) && !Strings.isNullOrEmpty(volumeSetPath))
-            || (!Strings.isNullOrEmpty(volumeSetName) && Strings.isNullOrEmpty(volumeSetPath))){
+            if ((Strings.isNullOrEmpty(volumeSetName) && !Strings.isNullOrEmpty(volumeSetPath))
+            || (!Strings.isNullOrEmpty(volumeSetName) && Strings.isNullOrEmpty(volumeSetPath))) {
                 return FormValidation
                         .error("The Volume Set Path cannot be empty if the Volume Set Name is not empty and vice versa");
             }
@@ -626,7 +836,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckJenkinsControllerUrl(@QueryParameter String jenkinsControllerUrl) {
-            if(Strings.isNullOrEmpty(jenkinsControllerUrl)){
+            if (Strings.isNullOrEmpty(jenkinsControllerUrl)) {
                 return FormValidation
                         .error("The Jenkins Controller Url cannot be empty");
             }
@@ -634,7 +844,7 @@ public class Cloud extends hudson.slaves.Cloud {
         }
 
         public FormValidation doCheckApiKey(@QueryParameter String apiKey) {
-            if(Strings.isNullOrEmpty(apiKey)){
+            if (Strings.isNullOrEmpty(apiKey)) {
                 return FormValidation
                         .error("The Control Plane Api Key cannot be empty");
             }

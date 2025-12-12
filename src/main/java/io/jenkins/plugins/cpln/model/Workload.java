@@ -2,11 +2,16 @@ package io.jenkins.plugins.cpln.model;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
+/**
+ * Model class representing a CPLN Workload.
+ */
 @SuppressFBWarnings
 public class Workload {
     public static final String GETURI = "org/%s/gvc/%s/workload/%s";
     public static final String CREATEURI = "org/%s/gvc/%s/workload";
     public static final String DELETEURI = GETURI;
+    public static final String LISTURI = "org/%s/gvc/%s/workload";
+    
     public String id;
     public String name;
     public String description;
