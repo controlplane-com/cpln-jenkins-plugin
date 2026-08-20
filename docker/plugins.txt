@@ -1,0 +1,27 @@
+# Plugins baked into the image. Pinned by Jenkins' own update centre at build
+# time via jenkins-plugin-cli, which also resolves transitive dependencies.
+
+# Configuration as Code — this image is configured entirely from casc.yaml.
+configuration-as-code
+
+# Credentials, needed by JCasC to define the admin user and by most job types.
+credentials
+credentials-binding
+
+# Pipeline. A Jenkins that cannot run a Jenkinsfile is not useful to anyone.
+workflow-aggregator
+pipeline-stage-view
+
+# SCM.
+git
+
+# Agent connectivity. The Control Plane plugin launches inbound agents over
+# WebSocket, which lives in this plugin.
+instance-identity
+
+# UI and operability.
+matrix-auth
+timestamper
+ws-cleanup
+build-timeout
+antisamy-markup-formatter

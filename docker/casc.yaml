@@ -1,0 +1,43 @@
+# Base Configuration as Code for the controller. Read at every boot, so this
+# file — not the setup wizard and not hand-edits in the UI — is the source of
+# truth for everything it covers.
+#
+# CASC_JENKINS_CONFIG points at the DIRECTORY holding this file, so a deployment
+# can drop additional YAML alongside it (a Control Plane cloud definition, for
+# example) without rebuilding the image. Files are merged in name order.
+
+jenkins:
+  systemMessage: "Jenkins with the Control Plane cloud plugin"
+
+  # Build nothing on the controller. The Control Plane plugin provisions agent
+  # workloads on demand, and a controller that also runs builds competes with
+  # itself for the memory the JVM needs.
+  numExecutors: 0
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_ID:-admin}"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+  # Inbound agents connect over WebSocket to the HTTP port, so the legacy JNLP
+  # port is not needed. 0 = a random port, which is what the plugin's README
+  # asks for; -1 would disable it entirely.
+  slaveAgentPort: 0
+
+  # Jenkins' default crumb issuer is already active and already excludes the
+  # client IP, which is what a controller behind a proxy needs. Configuring it
+  # here is not free: `excludeClientIPFromCrumb` is NOT an attribute JCasC
+  # accepts on DefaultCrumbIssuer, and setting it aborts boot outright.
+
+unclassified:
+  location:
+    # Must be the URL AGENTS can reach, not just the one an operator types —
+    # agent workloads read it to dial back to the controller.
+    url: "${JENKINS_URL:-http://localhost:8080/}"
+    adminAddress: "${JENKINS_ADMIN_ADDRESS:-address not configured yet <nobody@nowhere>}"

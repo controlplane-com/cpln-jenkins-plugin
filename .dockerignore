@@ -1,0 +1,7 @@
+# The image is built from pom.xml + src only. Everything else is context the
+# daemon would upload and then ignore — target/ alone is hundreds of megabytes,
+# and docs/ carries a 2 MB .hpi and the screenshots.
+*
+!pom.xml
+!src
+!docker
