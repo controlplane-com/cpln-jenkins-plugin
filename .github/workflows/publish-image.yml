@@ -1,0 +1,135 @@
+# Publishes the Jenkins controller image on every merge to main, bumping the
+# patch version each time. The git tag is the record of what was published, so
+# the workflow reads the newest one to decide the next.
+---
+name: Publish Image
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      # Nothing under these paths reaches the image, so a change to one is not
+      # worth a new version. Kept deliberately short: negated patterns behave
+      # order-dependently here and are easy to get subtly wrong.
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version to publish (e.g. 2.1.0). Leave blank to bump the patch.'
+        required: false
+        type: string
+
+# One publish at a time. Two merges landing together would otherwise read the
+# same "latest tag" and both try to publish it.
+concurrency:
+  group: publish-image
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push the version tag
+  packages: write   # push to GHCR
+
+env:
+  IMAGE: ghcr.io/controlplane-com/cpln-jenkins
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags, so the next version can be computed
+
+      - name: Decide the version
+        id: version
+        run: |
+          set -euo pipefail
+          explicit='${{ inputs.version }}'
+          if [ -n "$explicit" ]; then
+            case "$explicit" in
+              [0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "::error::version must look like 2.1.0, got '$explicit'"; exit 1 ;;
+            esac
+            next="$explicit"
+            echo "explicit version requested: $next"
+          else
+            # No pipe to head: under `set -o pipefail` a SIGPIPE from git
+            # would abort the step. Take the first line by expansion instead.
+            tags=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)
+            latest=${tags%%$'\n'*}
+            if [ -z "$latest" ]; then
+              # Nothing published yet — seed from the plugin's own version so the
+              # first image is not an unrelated 0.0.1.
+              # Parsed rather than resolved with maven: the runner would need a
+              # JDK and a plugin download to answer a question one line of awk
+              # answers. Takes the first <version> AFTER the project's own
+              # artifactId, so the parent POM's version cannot be picked up.
+              next=$(awk '/<artifactId>cpln-jenkins-plugin<\/artifactId>/{f=1} f&&/<version>/{gsub(/.*<version>|<\/version>.*/,""); print; exit}' pom.xml)
+              case "$next" in
+                [0-9]*.[0-9]*.[0-9]*) ;;
+                *) echo "::error::could not read a version from pom.xml (got '$next'); publish once with workflow_dispatch and an explicit version"; exit 1 ;;
+              esac
+              echo "no tags yet; seeding from pom version: $next"
+            else
+              IFS=. read -r major minor patch <<<"${latest#v}"
+              next="${major}.${minor}.$((patch + 1))"
+              echo "latest tag $latest; next: $next"
+            fi
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; then
+            echo "::error::tag v${next} already exists"; exit 1
+          fi
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # Tag only after a successful push, so a failed build leaves no version
+      # claimed and the next run retries the same number.
+      - name: Tag the published commit
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "v${{ steps.version.outputs.version }}" \
+            -m "Image ${{ env.IMAGE }}:${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ steps.version.outputs.version }}"
+            echo "${{ env.IMAGE }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

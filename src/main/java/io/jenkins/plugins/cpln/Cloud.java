@@ -33,6 +33,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import jenkins.model.Jenkins;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.*;
 
 /**
@@ -563,6 +564,11 @@ public class Cloud extends hudson.slaves.Cloud {
     }
 
     @Extension
+    // Without a symbol this cloud cannot be expressed in Configuration as Code:
+    // JCasC rejects a `jenkins.clouds` entry it cannot name, and its own export
+    // writes the cloud under an EMPTY key, so the configuration does not even
+    // round-trip. Verified against a running controller before adding this.
+    @Symbol("cpln")
     @SuppressWarnings("unused")
     public static class DescriptorImpl extends Descriptor<hudson.slaves.Cloud> {
 
