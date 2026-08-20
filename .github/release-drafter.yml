@@ -1,4 +1,58 @@
-# See https://github.com/jenkinsci/.github/blob/master/.github/release-drafter.adoc
+# Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
+#
+# Self-contained on purpose. This file previously read `_extends: .github`, which
+# inherits a base config from a repo named `.github` in the SAME organization.
+# That works in jenkinsci, where this file was copied from and where
+# jenkinsci/.github supplies the required `template` key. controlplane-com has no
+# `.github` repo, so nothing was inherited and every run failed validation with
+# `"template" is required`. It had never worked in this repository.
 ---
-_extends: .github
+name-template: $NEXT_MINOR_VERSION
 tag-template: cpln-jenkins-plugin-$NEXT_MINOR_VERSION
+version-template: $MAJOR.$MINOR.$PATCH
+
+categories:
+  - title: 💥 Breaking changes
+    labels:
+      - breaking
+  - title: 🚀 New features and improvements
+    labels:
+      - enhancement
+      - feature
+      - rfe
+  - title: 🐛 Bug fixes
+    labels:
+      - bug
+      - fix
+      - bugfix
+      - regression
+  - title: 📝 Documentation
+    labels:
+      - documentation
+  - title: 🚦 Tests
+    labels:
+      - test
+      - tests
+  - title: 👻 Maintenance
+    labels:
+      - chore
+      - internal
+      - maintenance
+  - title: ✍ Other changes
+  - title: 📦 Dependency updates
+    labels:
+      - dependencies
+    collapse-after: 15
+
+exclude-labels:
+  - reverted
+  - no-changelog
+  - skip-changelog
+  - invalid
+
+change-template: '* $TITLE (#$NUMBER) @$AUTHOR'
+sort-by: merged_at
+sort-direction: descending
+
+template: |
+  $CHANGES
