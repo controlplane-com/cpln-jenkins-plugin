@@ -1,0 +1,22 @@
+jenkins:
+  numExecutors: 0
+  clouds:
+    - cpln:
+        name: "test-cloud"
+        org: "test-org"
+        gvc: "test-gvc"
+        agentWorkload: "jenkins-agent"
+        labels: "cpln linux"
+        useUniqueAgents: true
+        allowJobsWithoutLabels: false
+        executors: 2
+        cpu: 250
+        memory: 768
+        retentionMins: 7
+        provisioningCooldownSecs: 45
+        agentImage: "jenkins/inbound-agent:latest"
+        volumeSetName: ""
+        volumeSetPath: ""
+        identity: ""
+        jenkinsControllerUrl: "http://jenkins.example.cpln.local:8080/"
+        apiKey: "test-api-key"

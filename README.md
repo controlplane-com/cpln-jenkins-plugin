@@ -20,7 +20,7 @@ https://maven.apache.org/download.cgi
 #### From the project root, run: 
 ```mvn clean install```
 
-Note: the plugin build currently supports Jenkins controller versions of 2.462.3+. 
+Note: the plugin build supports Jenkins controller versions of 2.479.3+. That baseline is the first Jenkins LTS on Jakarta EE (Jenkins moved from `javax.servlet` to `jakarta.servlet` at 2.475), so controllers older than 2.475 are not supported. 
 
 ### Option A: Run the Jenkins controller from the dev env
 
